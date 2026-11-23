@@ -3,7 +3,7 @@
 Output: a probability map over the FOV, already projected on the ground: one
 value per (bearing, range) cell = how much that cell looks like the target.
 
-Read SEGMENTATOR.md for the model in words and pseudocode.
+See docs/segmentator.md for the model in words and pseudocode.
 
 This file is the SIMULATOR only: it is the only place that knows the true
 target position. What the filter believes about the segmentator lives in

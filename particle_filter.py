@@ -1,6 +1,6 @@
 """Particle filter for the target position (x, y). Robot pose is known.
 
-Read PARTICLE_FILTER.md for the explanation and pseudocode.
+See docs/particle-filter.md for the explanation and pseudocode.
 """
 
 import math
@@ -103,7 +103,7 @@ class ParticleFilter:
 
     def jitter_fixed(self) -> None:
         """Same noise every frame: JITTER px. Simple, but puts a floor on how
-        tight the cloud can get (see PARTICLE_FILTER.md, Jitter)."""
+        tight the cloud can get (see docs/particle-filter.md, Jitter)."""
         self.particles = self.particles + self.rng.normal(0, JITTER, self.particles.shape)
 
     def jitter_adaptive(self) -> None:
