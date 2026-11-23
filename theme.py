@@ -15,8 +15,6 @@ TABLE_FILL = (20, 22, 28)
 TABLE_EDGE = (58, 63, 76)
 PARTICLE = (157, 140, 255)
 TARGET = (255, 255, 255)
-DET_TRUE = (91, 228, 155)
-DET_FALSE = (255, 107, 107)
 MAP = (91, 228, 155)  # segmentation map heatmap (drawn translucent)
 
 ENTROPY = (245, 185, 66)  # amber

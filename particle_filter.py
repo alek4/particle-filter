@@ -9,25 +9,19 @@ import numpy as np
 import pygame
 
 import theme
-from robot import Robot, wrap_angle
-from segmentator import Detection, ProbMap
+from robot import Robot
+from segmentator import ProbMap
 
 # ---------------------------------------------------------------------------
-# What the filter believes about the segmentator.
-# Same values as the simulator for now, but they are independent: you can
-# change one without the other to test a wrong model.
+# What the filter believes about the segmentator. Independent of the simulator
+# values: change one without the other to test a wrong model.
+P_TP_NEAR = 0.95  # P(target shows up in the map | visible), target very close
+P_TP_FAR = 0.5  # same, target at the edge of the FOV range
 
-# Points mode (its "confusion matrix" + noise)
-P_TP_NEAR = 0.95  # P(detected | target visible), target very close
-P_TP_FAR = 0.5  # P(detected | target visible), target at the edge of the FOV range
-FALSE_RATE = 0.2  # average false positives per frame
-SIGMA_BEARING = math.radians(3)  # bearing noise of a true detection
-SIGMA_RANGE_FRAC = 0.10  # range noise of a true detection, as fraction of distance
-
-# Map mode: what map values look like (in practice: histograms measured on labelled data)
+# What map values look like (in practice: score histograms measured on labelled data)
 BACKGROUND_BETA = (1.0, 15.0)  # values on background cells ~ Beta(1, 15): mostly ~0.06
-TARGET_BETA = (3.0, 2.0)  # values on the target's cell, when detected ~ Beta(3, 2): mostly ~0.6
-FP_CELL_FRACTION = 0.002  # fraction of background cells covered by false-positive blobs (look like target)
+TARGET_BETA = (3.0, 2.0)  # values on the target's cell, when it shows up ~ Beta(3, 2): mostly ~0.6
+FP_CELL_FRACTION = 0.002  # fraction of background cells covered by false-positive blobs
 M_CLIP = 0.01  # map values are clipped to [M_CLIP, 1 - M_CLIP] (avoids weights of 0 or infinity)
 
 JITTER_MODE = "adaptive"  # "fixed" or "adaptive" (press J in the simulator to switch)
@@ -37,64 +31,65 @@ CELL = 10  # px, cell size of the grid used for entropy and the best-cell estima
 # ---------------------------------------------------------------------------
 
 
-def gauss(x: float, sigma: float) -> float:
-    """Normal probability density: high when x is near 0, ~0 when |x| >> sigma."""
-    return math.exp(-0.5 * (x / sigma) ** 2) / (math.sqrt(2 * math.pi) * sigma)
-
-
 def beta_pdf(x: float, a: float, b: float) -> float:
     """Beta probability density on [0, 1]: how typical the value x is."""
     log_norm = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
     return math.exp(log_norm + (a - 1) * math.log(x) + (b - 1) * math.log(1 - x))
 
 
+def f_target(m: float) -> float:
+    """How typical map value m is on the target's cell."""
+    return beta_pdf(m, *TARGET_BETA)
+
+
+def f_background(m: float) -> float:
+    """How typical map value m is on a background cell. A small fraction of
+    background cells are false-positive blobs, which look like the target."""
+    return (1 - FP_CELL_FRACTION) * beta_pdf(m, *BACKGROUND_BETA) + FP_CELL_FRACTION * f_target(m)
+
+
 class ParticleFilter:
-    def __init__(self, n: int, region: pygame.Rect, seed: int | None = None) -> None:
-        """region: the area where the target can be (e.g. a table), used for the prior."""
-        self.n: int = n
-        self.region: pygame.Rect = pygame.Rect(region)
-        self.rng: np.random.Generator = np.random.default_rng(seed)
-        self.particles: np.ndarray = np.empty((n, 2))  # each row: a guess (x, y) of the target
-        self.weights: np.ndarray = np.empty(n)  # how much we believe each guess, sums to 1
-        self.jitter_mode: str = JITTER_MODE  # "fixed" or "adaptive"
+    def __init__(self, n: int, table: pygame.Rect, seed: int | None = None) -> None:
+        """table: the area the target is known to be on (the prior)."""
+        self.n = n
+        self.table = pygame.Rect(table)
+        self.rng = np.random.default_rng(seed)
+        self.jitter_mode = JITTER_MODE  # "fixed" or "adaptive"
+        self.particles = np.empty((n, 2))  # each row: a guess (x, y) of the target
+        self.weights = np.empty(n)  # weights from the last update (sum to 1); stale after resample()
 
         # Summary of the distribution, recomputed after every step (see compute_stats)
-        self.entropy: float = 1.0  # 0 = all weight in one cell, 1 = uniform over the table
-        self.best_prob: float = 0.0  # weight (probability) in the heaviest cell
-        self.best_cell: pygame.Rect = pygame.Rect(0, 0, CELL, CELL)  # the heaviest cell
-        self.estimate: tuple[float, float] = (0.0, 0.0)  # weighted mean inside best_cell
+        self.entropy = 1.0  # 0 = all weight in one cell, 1 = uniform over the table
+        self.best_prob = 0.0  # weight (probability) in the heaviest cell
+        self.best_cell = pygame.Rect(0, 0, CELL, CELL)  # the heaviest cell
+        self.estimate = (0.0, 0.0)  # weighted mean of the particles inside best_cell
 
         self.init_prior()
 
     def init_prior(self) -> None:
         """Prior: the target is on the table, equally likely anywhere on it."""
-        r = self.region
-        self.particles = np.column_stack(
-            (
-                self.rng.uniform(r.left, r.right, self.n),
-                self.rng.uniform(r.top, r.bottom, self.n),
-            )
-        )
+        t = self.table
+        xs = self.rng.uniform(t.left, t.right, self.n)
+        ys = self.rng.uniform(t.top, t.bottom, self.n)
+        self.particles = np.column_stack((xs, ys))
         self.weights = np.full(self.n, 1.0 / self.n)
         self.compute_stats()
 
     # ------------------------------------------------------------------ filter
-    def step(self, robot: Robot, measurement: list[Detection] | ProbMap) -> None:
-        """One filter iteration per segmentator frame.
-
-        measurement: point detections (points mode) or a probability map (map mode).
-        """
-        self.resample()
+    def step(self, robot: Robot, pmap: ProbMap) -> None:
+        """One filter iteration per segmentator frame (Probabilistic Robotics, Table 4.3)."""
         self.jitter()
-        self.update(robot, measurement)
+        self.update(robot, pmap)
         self.normalize()
-        self.compute_stats()
+        self.compute_stats()  # on the weighted set, before resampling
+        self.resample()
 
     def resample(self) -> None:
-        """Draw N particles from the current ones, with probability = weight."""
+        """Draw N particles from the current ones, with probability = weight.
+        The result is an unweighted set: the weights are now the number of
+        copies. self.weights is not used again until update() overwrites it."""
         idx = self.rng.choice(self.n, size=self.n, p=self.weights)
         self.particles = self.particles[idx]
-        self.weights = np.full(self.n, 1.0 / self.n)
 
     def jitter(self) -> None:
         """Nudge each particle by a little noise, so copies made by resampling
@@ -103,97 +98,47 @@ class ParticleFilter:
             self.jitter_fixed()
         else:
             self.jitter_adaptive()
-        r = self.region
-        self.particles[:, 0] = np.clip(self.particles[:, 0], r.left, r.right)
-        self.particles[:, 1] = np.clip(self.particles[:, 1], r.top, r.bottom)
+        t = self.table
+        self.particles = np.clip(self.particles, (t.left, t.top), (t.right, t.bottom))
 
     def jitter_fixed(self) -> None:
         """Same noise every frame: JITTER px. Simple, but puts a floor on how
-        tight the cloud can get (~7 px wide with 3 px)."""
+        tight the cloud can get (see PARTICLE_FILTER.md, Jitter)."""
         self.particles = self.particles + self.rng.normal(0, JITTER, self.particles.shape)
 
     def jitter_adaptive(self) -> None:
         """Noise proportional to the current spread of the cloud (separately in
         x and y): big while particles are spread out and exploring, small once
         they have converged, so it does not blur a precise estimate.
-        The factor N^(-1/6) is the standard rule of thumb for 2D (0.35 for N=500).
+        The factor N^(-1/6) is the standard rule of thumb for 2D (0.46 for N=100).
         """
         scale = self.n ** (-1 / 6)
         std = np.maximum(scale * self.particles.std(axis=0), JITTER_MIN)  # (std_x, std_y)
         self.particles = self.particles + self.rng.normal(0, 1, self.particles.shape) * std
 
-    def update(self, robot: Robot, measurement: list[Detection] | ProbMap) -> None:
+    def update(self, robot: Robot, pmap: ProbMap) -> None:
+        """Weights are SET (not multiplied): the particles come from a resample,
+        so the old weights are already encoded in the number of copies."""
         for i, (px, py) in enumerate(self.particles):
-            if isinstance(measurement, ProbMap):
-                self.weights[i] = self.likelihood_map(px, py, robot, measurement)
-            else:
-                self.weights[i] = self.likelihood(px, py, robot, measurement)
+            self.weights[i] = self.likelihood(px, py, robot, pmap)
 
-    def likelihood_map(self, px: float, py: float, robot: Robot, pmap: ProbMap) -> float:
-        """Map mode: how well does "the target is at (px, py)" explain the map?
+    def likelihood(self, px: float, py: float, robot: Robot, pmap: ProbMap) -> float:
+        """How much more likely is the map if the target is at (px, py) than if it is not?
 
-        Read the map value m at the particle's cell. Same structure as points mode:
-
-          not visible -> 1 (baseline: the map says nothing about this particle)
-          visible     -> P_FN                              (target missed: cell looks like background)
-                       + P_TP * f_target(m) / f_background(m)   (target detected, here)
-
-        The ratio says how much more typical m is of a target cell than of a
-        background cell: ~0 for m ~ 0.06, large for m ~ 0.5+.
-
-        f_background includes false-positive blobs (a fraction FP_CELL_FRACTION
-        of background cells looks like a target). This caps the ratio at about
-        1 / FP_CELL_FRACTION: a strong value is never "impossible" on background,
-        so one false blob cannot grab all the particles in one frame.
+        Read the map value m at the particle's cell, then:
+          outside the FOV -> 1: the map says nothing about this particle
+          inside the FOV  -> P(m | target here) / P(m | no target here)
         """
-        r = math.hypot(px - robot.x, py - robot.y)
-        b = wrap_angle(math.atan2(py - robot.y, px - robot.x) - robot.heading)
+        r, b = robot.range_bearing(px, py)
         m = pmap.lookup(b, r)
         if m is None:
             return 1.0
         m = min(max(m, M_CLIP), 1.0 - M_CLIP)
-        p_tp = P_TP_NEAR + (P_TP_FAR - P_TP_NEAR) * r / robot.fov_range
-        f_target = beta_pdf(m, *TARGET_BETA)
-        f_background = (1 - FP_CELL_FRACTION) * beta_pdf(m, *BACKGROUND_BETA) + FP_CELL_FRACTION * f_target
-        return (1.0 - p_tp) + p_tp * f_target / f_background
 
-    def likelihood(
-        self, px: float, py: float, robot: Robot, detections: list[Detection]
-    ) -> float:
-        """How well does "the target is at (px, py)" explain this frame's detections?
-
-        Only RELATIVE values matter (weights get normalised), so everything is
-        measured against a baseline: a particle the robot cannot see scores 1.
-        """
-        # Where would the target appear to the robot if it were at this particle?
-        r = math.hypot(px - robot.x, py - robot.y)
-        b = wrap_angle(math.atan2(py - robot.y, px - robot.x) - robot.heading)
-        visible = r <= robot.fov_range and abs(b) <= robot.fov / 2
-
-        # Case A: not visible. The target can't have caused any detection, so
-        # every detection must be a false positive. This is the baseline.
-        if not visible:
-            return 1.0
-
-        # Case B: visible. Confusion matrix, but P_TP drops with distance.
-        p_tp = P_TP_NEAR + (P_TP_FAR - P_TP_NEAR) * r / robot.fov_range
-        p_fn = 1.0 - p_tp
-
-        # B1: the target was missed -> all detections are false positives,
-        #     same as the baseline, times the chance of missing it.
-        w = p_fn
-
-        # B2: the target was detected and it is detection z (the rest are
-        #     false positives). How plausible depends on how close z is to
-        #     where this particle would appear, compared to how plausible it is
-        #     that z was just a false positive landing there.
-        fp_density = FALSE_RATE / (robot.fov * robot.fov_range)  # false positives per (rad * px)
-        sigma_r = max(SIGMA_RANGE_FRAC * r, 1.0)
-        for z in detections:
-            closeness = gauss(wrap_angle(z.bearing - b), SIGMA_BEARING) * gauss(z.range - r, sigma_r)
-            w += p_tp * closeness / fp_density
-
-        return w
+        p_tp = P_TP_NEAR + (P_TP_FAR - P_TP_NEAR) * r / robot.fov_range  # harder to see when far
+        target_here = p_tp * f_target(m) + (1 - p_tp) * f_background(m)  # seen, or missed
+        no_target = f_background(m)
+        return target_here / no_target
 
     def normalize(self) -> None:
         self.weights = self.weights / self.weights.sum()
@@ -207,13 +152,13 @@ class ParticleFilter:
         best_cell    = cell with the largest mass, best_prob = that mass
         estimate     = weighted mean of the particles inside best_cell
         """
-        r = self.region
-        nx = math.ceil(r.width / CELL)  # cells along x
-        ny = math.ceil(r.height / CELL)  # cells along y
+        t = self.table
+        nx = math.ceil(t.width / CELL)  # cells along x
+        ny = math.ceil(t.height / CELL)  # cells along y
 
         # Which cell each particle falls in (min() keeps particles on the far edge in the last cell)
-        ix = np.minimum(((self.particles[:, 0] - r.left) // CELL).astype(int), nx - 1)
-        iy = np.minimum(((self.particles[:, 1] - r.top) // CELL).astype(int), ny - 1)
+        ix = np.minimum(((self.particles[:, 0] - t.left) // CELL).astype(int), nx - 1)
+        iy = np.minimum(((self.particles[:, 1] - t.top) // CELL).astype(int), ny - 1)
         cell_id = ix * ny + iy  # one number per cell
         cell_mass = np.bincount(cell_id, weights=self.weights, minlength=nx * ny)
 
@@ -221,11 +166,11 @@ class ParticleFilter:
         p = cell_mass[cell_mass > 0]  # empty cells contribute 0 (0 * log 0 = 0)
         self.entropy = float(-(p * np.log(p)).sum() / math.log(nx * ny))
 
-        # Best cell
+        # Best cell, and the estimate inside it
         best = int(np.argmax(cell_mass))
         bx, by = divmod(best, ny)
         self.best_prob = float(cell_mass[best])
-        self.best_cell = pygame.Rect(r.left + bx * CELL, r.top + by * CELL, CELL, CELL)
+        self.best_cell = pygame.Rect(t.left + bx * CELL, t.top + by * CELL, CELL, CELL)
         inside = cell_id == best
         w = self.weights[inside]
         ex, ey = (w[:, None] * self.particles[inside]).sum(axis=0) / w.sum()
@@ -233,8 +178,8 @@ class ParticleFilter:
 
     # ----------------------------------------------------------------- drawing
     def draw_table(self, screen: pygame.Surface) -> None:
-        pygame.draw.rect(screen, theme.TABLE_FILL, self.region)
-        pygame.draw.rect(screen, theme.TABLE_EDGE, self.region, width=1)
+        pygame.draw.rect(screen, theme.TABLE_FILL, self.table)
+        pygame.draw.rect(screen, theme.TABLE_EDGE, self.table, width=1)
 
     def draw(self, screen: pygame.Surface) -> None:
         """Particles, best cell and estimate (the table is drawn by draw_table)."""
